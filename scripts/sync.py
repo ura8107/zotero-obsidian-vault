@@ -12,9 +12,9 @@ Deep-dive structured summaries (theory / prior work / research design /
 data / method / results / implications) are NOT written here -- that's
 an LLM job. See .claude/skills/process-queue and queue.md.
 
-Requires: https://github.com/ has zotero-mcp-server installed as a
-`zotero-cli` command (e.g. `uv tool install zotero-mcp-server`), with
-Zotero's "Local API" enabled in Zotero's Advanced preferences.
+Requires zotero-mcp-server installed as a `zotero-cli` command (e.g.
+`uv tool install zotero-mcp-server`), with Zotero's "Local API" enabled
+in Zotero's Advanced preferences.
 """
 import json
 import os
@@ -52,12 +52,24 @@ PAPERS_DIR = VAULT / "papers"
 STATE_PATH = VAULT / ".zotero-sync" / "state.json"
 QUEUE_PATH = VAULT / "queue.md"
 METADATA_END_MARKER = "<!-- ZOTERO-SYNC:METADATA:END -->"
+_ILLEGAL_FILENAME_CHARS = re.compile(r'[/\\:*?"<>|]')
+_KEY_COMMENT_RE = re.compile(r"<!-- key: ([A-Za-z0-9]+) -->")
 
 
 def load_state() -> dict:
-    if STATE_PATH.exists():
-        return json.loads(STATE_PATH.read_text())
-    return {}
+    """State maps key -> {date_modified, filename}. Transparently upgrades
+    the older flat {key: date_modified} format some early notes may have
+    used (filename == "<key>.md" then)."""
+    if not STATE_PATH.exists():
+        return {}
+    raw = json.loads(STATE_PATH.read_text())
+    migrated = {}
+    for key, value in raw.items():
+        if isinstance(value, str):
+            migrated[key] = {"date_modified": value, "filename": f"{key}.md"}
+        else:
+            migrated[key] = value
+    return migrated
 
 
 def save_state(state: dict) -> None:
@@ -87,13 +99,54 @@ def existing_deep_dive_status(path: Path) -> str | None:
     return m.group(1) if m else None
 
 
+def sanitize_tag(tag: str) -> str:
+    """Obsidian tags can't contain spaces (or they silently stop working)."""
+    return re.sub(r"\s+", "-", tag.strip())
+
+
 def yaml_list(values: list[str]) -> str:
     if not values:
         return "[]"
     return "[" + ", ".join(json.dumps(v, ensure_ascii=False) for v in values) + "]"
 
 
-def render_note(key: str, meta: dict, pdf_path: str | None, deep_dive: str) -> str:
+def _slugify_part(text: str, max_len: int) -> str:
+    text = _ILLEGAL_FILENAME_CHARS.sub("-", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:max_len].rstrip() if len(text) > max_len else text
+
+
+def _author_part(creators: list[str]) -> str:
+    # creators are "Lastname Firstname" (see render_note) -> first token = surname
+    surnames = [c.strip().split(" ")[0] for c in creators if c.strip()]
+    if not surnames:
+        return ""
+    if len(surnames) == 1:
+        return surnames[0]
+    if len(surnames) == 2:
+        return f"{surnames[0]} and {surnames[1]}"
+    return f"{surnames[0]} et al."
+
+
+def make_filename(key: str, creators: list[str], year: str, title: str, taken: dict[str, str]) -> str:
+    """Human-searchable filename, mirroring Zotero's own default attachment
+    naming (Author - Year - Title). `taken` maps filename -> owning key, so a
+    genuine collision (two items that render to the same name) gets
+    disambiguated instead of one silently overwriting the other."""
+    year_match = re.match(r"(\d{4})", year or "")
+    parts = [p for p in [
+        _author_part(creators),
+        year_match.group(1) if year_match else "",
+        _slugify_part(title or "no title", 120),
+    ] if p]
+    base = _slugify_part(" - ".join(parts) or key, 180)
+    candidate = f"{base}.md"
+    if taken.get(candidate, key) == key:
+        return candidate
+    return f"{base} ({key}).md"
+
+
+def render_note(key: str, meta: dict, pdf_path: str | None, deep_dive: str) -> tuple[str, list[str], str, str]:
     data = meta["data"]["data"]
     title = data.get("title") or "(no title)"
     creators = [
@@ -102,7 +155,7 @@ def render_note(key: str, meta: dict, pdf_path: str | None, deep_dive: str) -> s
     ]
     year = data.get("date", "")
     doi = data.get("DOI", "")
-    tags = [t.get("tag", "") for t in data.get("tags", [])]
+    tags = [sanitize_tag(t.get("tag", "")) for t in data.get("tags", [])]
     collections = data.get("collections", [])
     item_type = data.get("itemType", "")
     date_added = data.get("dateAdded", "")
@@ -147,7 +200,7 @@ def render_note(key: str, meta: dict, pdf_path: str | None, deep_dive: str) -> s
 
 {METADATA_END_MARKER}
 """
-    return fm + body
+    return fm + body, creators, year, title
 
 
 def new_file_tail(has_pdf: bool) -> str:
@@ -174,27 +227,34 @@ are filled in by the deep-dive pass (see queue.md and the process-queue skill).
 """
 
 
-def upsert_note(key: str, meta: dict, pdf_path: str | None) -> tuple[bool, str]:
-    """Write/update papers/<key>.md. Returns (is_new, deep_dive_status)."""
-    path = PAPERS_DIR / f"{key}.md"
-    is_new = not path.exists()
-    old_status = existing_deep_dive_status(path)
+def upsert_note(key: str, meta: dict, pdf_path: str | None, state: dict, taken: dict[str, str]) -> tuple[str, str]:
+    """Write/update the note for `key`. Returns (filename, deep_dive_status)."""
+    prev = state.get(key, {})
+    old_filename = prev.get("filename")
+    old_path = PAPERS_DIR / old_filename if old_filename else None
+
+    old_status = existing_deep_dive_status(old_path) if old_path else None
     if old_status in ("pending", "done"):
         deep_dive = old_status
     else:
         deep_dive = "pending" if pdf_path else "n/a"
 
-    head = render_note(key, meta, pdf_path, deep_dive)
+    head, creators, year, title = render_note(key, meta, pdf_path, deep_dive)
+    new_filename = make_filename(key, creators, year, title, taken)
+    new_path = PAPERS_DIR / new_filename
 
-    if path.exists():
-        old_text = path.read_text()
+    if old_path and old_path.exists():
+        old_text = old_path.read_text()
         idx = old_text.find(METADATA_END_MARKER)
-        if idx != -1:
-            tail = old_text[idx + len(METADATA_END_MARKER):]
-            path.write_text(head + tail)
-            return False, deep_dive
-    path.write_text(head + new_file_tail(bool(pdf_path)))
-    return is_new, deep_dive
+        tail = old_text[idx + len(METADATA_END_MARKER):] if idx != -1 else new_file_tail(bool(pdf_path))
+        if old_path != new_path:
+            old_path.unlink()
+    else:
+        tail = new_file_tail(bool(pdf_path))
+
+    new_path.write_text(head + tail)
+    taken[new_filename] = key
+    return new_filename, deep_dive
 
 
 _PDF_PATH_RE = re.compile(
@@ -216,14 +276,15 @@ def resolve_pdf_path(key: str) -> str | None:
     return m.group(1) if m else None
 
 
-def update_queue(pending_keys: set[str]) -> None:
-    existing = set()
+def update_queue(pending: dict[str, str]) -> None:
+    """pending: key -> filename, for items newly promoted to the queue."""
+    existing_keys = set()
     lines: list[str] = []
     if QUEUE_PATH.exists():
         for line in QUEUE_PATH.read_text().splitlines():
-            m = re.search(r"papers/([A-Za-z0-9]+)\.md", line)
+            m = _KEY_COMMENT_RE.search(line)
             if m:
-                existing.add(m.group(1))
+                existing_keys.add(m.group(1))
             lines.append(line)
     else:
         lines.append("# Deep-Dive Queue")
@@ -232,9 +293,9 @@ def update_queue(pending_keys: set[str]) -> None:
         lines.append("Remove a line once `.claude/skills/process-queue` has processed it.")
         lines.append("")
 
-    new_keys = pending_keys - existing
-    for key in sorted(new_keys):
-        lines.append(f"- [ ] [[papers/{key}.md]]")
+    new_keys = {k: f for k, f in pending.items() if k not in existing_keys}
+    for key, filename in sorted(new_keys.items(), key=lambda kv: kv[1]):
+        lines.append(f"- [ ] [[papers/{filename}]] <!-- key: {key} -->")
 
     if new_keys:
         QUEUE_PATH.write_text("\n".join(lines) + "\n")
@@ -248,16 +309,17 @@ def main() -> None:
     reader.close()
 
     state = load_state()
+    taken = {v["filename"]: k for k, v in state.items() if v.get("filename")}
     changed = [
         it for it in all_items
-        if state.get(it.key) != it.date_modified
+        if state.get(it.key, {}).get("date_modified") != it.date_modified
     ]
     if limit:
         changed = changed[:limit]
 
     print(f"library items: {len(all_items)} | changed since last sync: {len(changed)}")
 
-    pending_for_queue: set[str] = set()
+    pending_for_queue: dict[str, str] = {}
     ok, failed = 0, 0
     for i, item in enumerate(changed, 1):
         meta = cli_json("get", "metadata", item.key)
@@ -265,10 +327,10 @@ def main() -> None:
             failed += 1
             continue
         pdf_path = resolve_pdf_path(item.key)
-        _, deep_dive = upsert_note(item.key, meta, pdf_path)
+        filename, deep_dive = upsert_note(item.key, meta, pdf_path, state, taken)
         if deep_dive == "pending":
-            pending_for_queue.add(item.key)
-        state[item.key] = item.date_modified
+            pending_for_queue[item.key] = filename
+        state[item.key] = {"date_modified": item.date_modified, "filename": filename}
         ok += 1
         if i % 50 == 0:
             print(f"  ...{i}/{len(changed)}")
