@@ -32,6 +32,14 @@ Title / authors / DOI / Zotero link / Abstract (sync.py overwrites every run)
 **Everything above `<!-- ZOTERO-SYNC:METADATA:END -->` belongs to `sync.py`. Everything below belongs to
 you or the deep-dive skill.** Breaking that boundary means re-syncing silently destroys hand-written content.
 
+## Citation metadata
+
+Every note's frontmatter includes what a `.bib` entry would: `citekey`, `bibtex_type`, and whatever
+fields Zotero/Better BibTeX returned for that item (`journal`, `volume`, `pages`, `publisher`, `isbn`,
+`url`, ...). The full raw BibTeX entry is also embedded in the note body under "## Citation (BibTeX)"
+for direct copy-paste into LaTeX. If Better BibTeX is installed in Zotero, `citekey` matches what your
+`.bib` exports elsewhere already use, so notes and papers cite consistently.
+
 ## PDFs
 
 PDFs are never copied into the vault. `zotero-cli path <key>` resolves the real file location on disk —

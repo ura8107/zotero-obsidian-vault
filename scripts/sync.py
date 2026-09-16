@@ -55,6 +55,11 @@ METADATA_END_MARKER = "<!-- ZOTERO-SYNC:METADATA:END -->"
 _ILLEGAL_FILENAME_CHARS = re.compile(r'[/\\:*?"<>|]')
 _KEY_COMMENT_RE = re.compile(r"<!-- key: ([A-Za-z0-9]+) -->")
 
+# Already captured under their own frontmatter keys elsewhere, or too long
+# / noisy to belong in frontmatter (abstract goes in the body; file leaks
+# an absolute local path and duplicates pdf_path).
+BIBTEX_SKIP_FIELDS = {"file", "abstract", "author", "title", "keywords", "year", "doi"}
+
 
 def load_state() -> dict:
     """State maps key -> {date_modified, filename}. Transparently upgrades
@@ -104,10 +109,14 @@ def sanitize_tag(tag: str) -> str:
     return re.sub(r"\s+", "-", tag.strip())
 
 
+def yaml_str(value: str) -> str:
+    return json.dumps(value, ensure_ascii=False)
+
+
 def yaml_list(values: list[str]) -> str:
     if not values:
         return "[]"
-    return "[" + ", ".join(json.dumps(v, ensure_ascii=False) for v in values) + "]"
+    return "[" + ", ".join(yaml_str(v) for v in values) + "]"
 
 
 def _slugify_part(text: str, max_len: int) -> str:
@@ -146,6 +155,66 @@ def make_filename(key: str, creators: list[str], year: str, title: str, taken: d
     return f"{base} ({key}).md"
 
 
+def parse_bibtex(text: str) -> tuple[str, str, dict[str, str]]:
+    """Parse a single BibTeX entry. Handles brace-nested values (abstracts
+    etc. can contain `{}`) and bare (unbraced) values like `month = jan`."""
+    m = re.match(r"@(\w+)\{([^,]+),\s*", text)
+    if not m:
+        return "", "", {}
+    entry_type, citekey = m.group(1), m.group(2).strip()
+    rest = text[m.end():]
+    fields: dict[str, str] = {}
+    pos = 0
+    while pos < len(rest):
+        fm = re.match(r"\s*(\w+)\s*=\s*", rest[pos:])
+        if not fm:
+            break
+        name = fm.group(1)
+        pos += fm.end()
+        if pos < len(rest) and rest[pos] == "{":
+            depth, start = 0, pos
+            while pos < len(rest):
+                if rest[pos] == "{":
+                    depth += 1
+                elif rest[pos] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        pos += 1
+                        break
+                pos += 1
+            value = rest[start + 1:pos - 1]
+        else:
+            end_m = re.search(r"[,}]", rest[pos:])
+            end = pos + end_m.start() if end_m else len(rest)
+            value = rest[pos:end]
+            pos = end
+        fields[name] = value.strip()
+        comma_m = re.match(r"\s*,\s*", rest[pos:])
+        if comma_m:
+            pos += comma_m.end()
+        else:
+            break
+    return entry_type, citekey, fields
+
+
+def fetch_bibtex(key: str) -> tuple[str, str, dict[str, str], str] | None:
+    """Full BibTeX entry for `key` (uses Better BibTeX's citekey if that
+    plugin is installed in Zotero, else Zotero's own bibtex export).
+    Returns (entry_type, citekey, fields, raw_bibtex_text) or None."""
+    res = cli_json("export", "--item-keys", key, "--format", "bibtex")
+    if not res or not res.get("ok"):
+        return None
+    block = res.get("data", {}).get("bibliography", "")
+    m = re.search(r"```bibtex\n(.*?)\n```", block, re.DOTALL)
+    if not m:
+        return None
+    raw = m.group(1)
+    entry_type, citekey, fields = parse_bibtex(raw)
+    if not citekey:
+        return None
+    return entry_type, citekey, fields, raw
+
+
 def render_note(key: str, meta: dict, pdf_path: str | None, deep_dive: str) -> tuple[str, list[str], str, str]:
     data = meta["data"]["data"]
     title = data.get("title") or "(no title)"
@@ -163,13 +232,21 @@ def render_note(key: str, meta: dict, pdf_path: str | None, deep_dive: str) -> t
     zotero_link = f"zotero://select/library/items/{key}"
     synced_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
-    fm = "\n".join([
+    bib = fetch_bibtex(key)
+    if bib:
+        bibtex_type, citekey, bibtex_fields, raw_bibtex = bib
+    else:
+        bibtex_type, citekey, bibtex_fields, raw_bibtex = item_type, "", {}, ""
+
+    fm_lines = [
         "---",
         f"zotero_key: {key}",
+        f"citekey: {citekey}",
         f'title: "{title}"',
         f"creators: {yaml_list(creators)}",
         f'year: "{year}"',
         f"item_type: {item_type}",
+        f"bibtex_type: {bibtex_type}",
         f'doi: "{doi}"',
         f"tags: {yaml_list(tags)}",
         f"collections: {yaml_list(collections)}",
@@ -180,11 +257,24 @@ def render_note(key: str, meta: dict, pdf_path: str | None, deep_dive: str) -> t
         f'zotero_link: "{zotero_link}"',
         f"deep_dive: {deep_dive}",
         f"synced_at: {synced_at}",
-        "---",
-    ])
+    ]
+    # Citation fields a .bib entry would carry (journal, volume, pages,
+    # publisher, isbn, url, ...) -- whatever Zotero/Better BibTeX gave us,
+    # minus what's already captured above under its own key.
+    for field_name in sorted(bibtex_fields):
+        if field_name in BIBTEX_SKIP_FIELDS:
+            continue
+        fm_lines.append(f"{field_name}: {yaml_str(bibtex_fields[field_name])}")
+    fm_lines.append("---")
+    fm = "\n".join(fm_lines)
 
     pdf_line = f"\n**PDF:** `{pdf_path}`" if pdf_path else ""
     abstract = data.get("abstractNote") or "_(none)_"
+    citation_block = (
+        f"\n## Citation (BibTeX)\n\n```bibtex\n{raw_bibtex}\n```\n"
+        if raw_bibtex else
+        "\n## Citation (BibTeX)\n\n_(BibTeX unavailable)_\n"
+    )
 
     body = f"""
 # {title}
@@ -197,7 +287,7 @@ def render_note(key: str, meta: dict, pdf_path: str | None, deep_dive: str) -> t
 ## Abstract
 
 {abstract}
-
+{citation_block}
 {METADATA_END_MARKER}
 """
     return fm + body, creators, year, title
