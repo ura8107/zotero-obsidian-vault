@@ -1,0 +1,77 @@
+filters:
+  and:
+    - "zotero_key != null"
+
+views:
+  - type: table
+    name: All Papers
+    order:
+      - title
+      - creators
+      - year
+      - journal
+      - tags
+      - doi
+      - deep_dive
+      - has_pdf
+    sort:
+      - property: date_added
+        direction: DESC
+
+  - type: table
+    name: Needs Summary
+    filters:
+      and:
+        - "deep_dive == \"pending\""
+    order:
+      - title
+      - creators
+      - year
+      - journal
+      - has_pdf
+    sort:
+      - property: date_added
+        direction: DESC
+
+  - type: table
+    name: With PDF
+    filters:
+      and:
+        - "has_pdf == true"
+    order:
+      - title
+      - creators
+      - year
+      - journal
+      - deep_dive
+      - pdf_path
+    sort:
+      - property: year
+        direction: DESC
+
+  - type: table
+    name: By Year
+    order:
+      - year
+      - title
+      - creators
+      - journal
+      - tags
+    sort:
+      - property: year
+        direction: DESC
+
+  - type: table
+    name: Citation Lookup
+    order:
+      - title
+      - creators
+      - citekey
+      - doi
+      - journal
+      - volume
+      - pages
+      - publisher
+    sort:
+      - property: title
+        direction: ASC
